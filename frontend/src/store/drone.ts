@@ -6,9 +6,11 @@ import type {
   TerrainPoint,
   FlightPlan,
   DroneConfig,
+} from '../types';
+import type {
   SimulationState,
   TerrainProfilePoint,
-} from '../types';
+} from '../core/types';
 import { planRoute, createFlightSimulator } from '../core';
 import { flightAnalyzer } from '../core/analytics';
 import { flightExporter } from '../core/export';
