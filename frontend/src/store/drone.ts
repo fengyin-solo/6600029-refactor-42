@@ -1,16 +1,19 @@
 import { defineStore } from 'pinia';
-import { ref, computed } from 'vue';
-import type { Waypoint, NoFlyZone, TerrainPoint, FlightPlan, DroneConfig } from '../types';
-import {
-  aStarPathfind,
-  rrtPathfind,
-  smoothPath,
-  calculateFlightStats,
-  checkTerrainCollision,
-  exportKML,
-  mockNoFlyZones,
-  mockTerrainData,
-} from '../utils/pathfinding';
+import { ref, computed, watch } from 'vue';
+import type {
+  Waypoint,
+  NoFlyZone,
+  TerrainPoint,
+  FlightPlan,
+  DroneConfig,
+  SimulationState,
+  TerrainProfilePoint,
+} from '../types';
+import { planRoute, createFlightSimulator } from '../core';
+import { flightAnalyzer } from '../core/analytics';
+import { flightExporter } from '../core/export';
+import { mockNoFlyZones, generateMockTerrain, defaultBounds } from '../core/data';
+import { generateId } from '../core/utils/geo';
 
 export const useDroneStore = defineStore('drone', () => {
   const waypoints = ref<Waypoint[]>([]);
@@ -18,8 +21,6 @@ export const useDroneStore = defineStore('drone', () => {
   const terrainData = ref<TerrainPoint[]>([]);
   const currentPlan = ref<FlightPlan | null>(null);
   const selectedAlgorithm = ref<'astar' | 'rrt'>('astar');
-  const isSimulating = ref(false);
-  const simProgress = ref(0);
   const mapCenter = ref<[number, number]>([39.9, 116.4]);
 
   const droneConfig = ref<DroneConfig>({
@@ -30,7 +31,13 @@ export const useDroneStore = defineStore('drone', () => {
     safeDistance: 30,
   });
 
-  // ─── Actions ──────────────────────────────────────────────────────────────
+  const simulator = createFlightSimulator();
+  const simulationState = ref<SimulationState>(simulator.getState());
+
+  simulator.onUpdate((state) => {
+    simulationState.value = state;
+  });
+
   function addWaypoint(
     lat: number,
     lng: number,
@@ -38,8 +45,14 @@ export const useDroneStore = defineStore('drone', () => {
     speed = 10,
     action: Waypoint['action'] = 'none'
   ) {
-    const id = `wp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    waypoints.value.push({ id, lat, lng, altitude, speed, action });
+    waypoints.value.push({
+      id: generateId('wp'),
+      lat,
+      lng,
+      altitude,
+      speed,
+      action,
+    });
   }
 
   function removeWaypoint(id: string) {
@@ -51,29 +64,34 @@ export const useDroneStore = defineStore('drone', () => {
     if (wp) Object.assign(wp, updates);
   }
 
-  function planRoute(start: [number, number], goal: [number, number]) {
-    const bounds = { minLat: 39.85, maxLat: 39.95, minLng: 116.35, maxLng: 116.45 };
-    let raw: Waypoint[];
-    if (selectedAlgorithm.value === 'astar') {
-      raw = aStarPathfind(start, goal, 30, noFlyZones.value, bounds);
-    } else {
-      raw = rrtPathfind(start, goal, noFlyZones.value);
-    }
-    const smoothed = smoothPath(raw);
-    waypoints.value = smoothed;
+  function planRouteWrapper(start: [number, number], goal: [number, number]) {
+    const result = planRoute(start, goal, noFlyZones.value, defaultBounds, {
+      algorithm: selectedAlgorithm.value,
+      gridSize: 30,
+      smoothSegments: 5,
+    });
+
+    waypoints.value = result.smoothedWaypoints;
     updatePlan();
+    return result;
   }
 
   function clearRoute() {
     waypoints.value = [];
     currentPlan.value = null;
-    simProgress.value = 0;
+    simulator.stop();
+    simulationState.value = simulator.getState();
   }
 
   function updatePlan() {
-    const stats = calculateFlightStats(waypoints.value, droneConfig.value);
+    if (waypoints.value.length < 2) {
+      currentPlan.value = null;
+      return;
+    }
+
+    const stats = flightAnalyzer.calculateStats(waypoints.value, droneConfig.value);
     currentPlan.value = {
-      id: `plan-${Date.now()}`,
+      id: generateId('plan'),
       name: 'Flight Plan',
       waypoints: [...waypoints.value],
       totalDistance: stats.totalDistance,
@@ -82,68 +100,82 @@ export const useDroneStore = defineStore('drone', () => {
     };
   }
 
-  let simInterval: ReturnType<typeof setInterval> | null = null;
-
   function simulateFlight() {
-    if (waypoints.value.length < 2 || isSimulating.value) return;
-    isSimulating.value = true;
-    simProgress.value = 0;
-    simInterval = setInterval(() => {
-      simProgress.value += 1;
-      if (simProgress.value >= 100) {
-        simProgress.value = 100;
-        isSimulating.value = false;
-        if (simInterval) clearInterval(simInterval);
-      }
-    }, 50);
+    if (waypoints.value.length < 2 || simulationState.value.isRunning) return;
+    simulator.start(waypoints.value, droneConfig.value, {
+      speedMultiplier: 1,
+      tickInterval: 50,
+    });
+  }
+
+  function pauseSimulation() {
+    simulator.pause();
+  }
+
+  function resumeSimulation() {
+    simulator.resume();
+  }
+
+  function stopSimulation() {
+    simulator.stop();
+    simulationState.value = simulator.getState();
   }
 
   function loadMockData() {
     noFlyZones.value = mockNoFlyZones;
-    terrainData.value = mockTerrainData;
+    terrainData.value = generateMockTerrain();
   }
 
-  function exportPlan(): string {
+  function exportPlan(format: 'kml' | 'geojson' | 'gpx' = 'kml'): string {
     if (!currentPlan.value) return '';
-    return exportKML(currentPlan.value);
+    return flightExporter.export(currentPlan.value, {
+      format,
+      name: currentPlan.value.name,
+      includeWaypointActions: true,
+    });
   }
 
-  // ─── Computed ─────────────────────────────────────────────────────────────
-  const totalDistance = computed(() => {
-    if (!currentPlan.value) return 0;
-    return currentPlan.value.totalDistance;
-  });
-
-  const estimatedTime = computed(() => {
-    if (!currentPlan.value) return 0;
-    return currentPlan.value.estimatedTime;
-  });
-
-  const batteryPercent = computed(() => {
-    if (!currentPlan.value) return 0;
-    return currentPlan.value.batteryUsage;
-  });
-
-  const terrainProfile = computed(() => {
-    if (waypoints.value.length < 2) return [];
-    return waypoints.value.map((wp) => {
-      let nearestElev = 0;
-      let minDist = Infinity;
-      for (const tp of terrainData.value) {
-        const d =
-          (tp.lat - wp.lat) ** 2 + (tp.lng - wp.lng) ** 2;
-        if (d < minDist) {
-          minDist = d;
-          nearestElev = tp.elevation;
-        }
+  watch(
+    () => waypoints.value.length,
+    () => {
+      if (waypoints.value.length >= 2) {
+        updatePlan();
       }
-      return {
-        lat: wp.lat,
-        lng: wp.lng,
-        altitude: wp.altitude,
-        terrainElevation: nearestElev,
-      };
-    });
+    }
+  );
+
+  const isSimulating = computed(() => simulationState.value.isRunning);
+  const simProgress = computed(() => simulationState.value.progress);
+  const totalDistance = computed(() => currentPlan.value?.totalDistance ?? 0);
+  const estimatedTime = computed(() => currentPlan.value?.estimatedTime ?? 0);
+  const batteryPercent = computed(() => currentPlan.value?.batteryUsage ?? 0);
+
+  const terrainProfile = computed((): TerrainProfilePoint[] => {
+    if (waypoints.value.length < 2) return [];
+    return flightAnalyzer.generateTerrainProfile(waypoints.value, terrainData.value);
+  });
+
+  const terrainAnalysis = computed(() => {
+    if (waypoints.value.length < 2) return null;
+    return flightAnalyzer.analyzeTerrain(
+      waypoints.value,
+      terrainData.value,
+      droneConfig.value.safeDistance
+    );
+  });
+
+  const noFlyZoneViolations = computed(() => {
+    if (waypoints.value.length < 2) return null;
+    return flightAnalyzer.checkNoFlyZoneViolations(
+      waypoints.value,
+      noFlyZones.value,
+      0
+    );
+  });
+
+  const flightStats = computed(() => {
+    if (waypoints.value.length < 2) return null;
+    return flightAnalyzer.calculateStats(waypoints.value, droneConfig.value);
   });
 
   return {
@@ -155,17 +187,24 @@ export const useDroneStore = defineStore('drone', () => {
     selectedAlgorithm,
     isSimulating,
     simProgress,
+    simulationState,
     mapCenter,
     totalDistance,
     estimatedTime,
     batteryPercent,
     terrainProfile,
+    terrainAnalysis,
+    noFlyZoneViolations,
+    flightStats,
     addWaypoint,
     removeWaypoint,
     updateWaypoint,
-    planRoute,
+    planRoute: planRouteWrapper,
     clearRoute,
     simulateFlight,
+    pauseSimulation,
+    resumeSimulation,
+    stopSimulation,
     loadMockData,
     exportPlan,
     updatePlan,
